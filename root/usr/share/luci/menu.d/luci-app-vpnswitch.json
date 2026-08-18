@@ -1,0 +1,13 @@
+{
+  "admin/services/vpnswitch": {
+    "title": "VPN Switch",
+    "order": 50,
+    "action": {
+      "type": "view",
+      "path": "vpnswitch/dashboard"
+    },
+    "depends": {
+      "acl": [ "luci-app-vpnswitch" ]
+    }
+  }
+}

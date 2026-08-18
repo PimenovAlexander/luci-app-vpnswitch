@@ -1,0 +1,26 @@
+{
+  "luci-app-vpnswitch": {
+    "description": "Grant UCI and RPC access to VPN Switch app",
+    "read": {
+      "ubus": {
+        "luci.vpnswitch": [
+          "get_status",
+          "switch_vpn",
+          "add_vless_profile",
+          "switch_vless_profile",
+          "delete_vless_profile"
+        ]
+      },
+      "uci": [
+        "network",
+        "firewall"
+      ]
+    },
+    "write": {
+      "uci": [
+        "network",
+        "firewall"
+      ]
+    }
+  }
+}
