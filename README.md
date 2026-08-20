@@ -4,6 +4,10 @@ LuCI page for switching between VPN tunnels on OpenWRT.
 Supports **AmneziaWG 2.0** tunnels and **VLESS+Reality via sing-box**.  
 Shows live status (up/down, last handshake, transfer stats) and switches the active tunnel with one click.
 
+> [!IMPORTANT]
+> **Disclaimer** As one can guess, this is 95% vibecoded. I'm sorry, I know - times are tough. But it works. I use it every day. You may also look at this as an example.
+
+
 ## Features
 
 - One card per AWG2 interface — endpoint, handshake age, transfer stats, Switch button
