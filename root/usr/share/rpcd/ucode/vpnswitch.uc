@@ -32,6 +32,17 @@ function get_active_fwd() {
 	return active;
 }
 
+// UCI disabled=1 alone does not reliably tear down an amneziawg interface —
+// netifd can leave the wg device up with a live handshake and, worse, a
+// route_allowed_ips default route still installed (it replaces the WAN
+// default route and is only restored by netifd's own teardown path, which
+// `disabled=1` + a bare network restart does not always trigger). Explicit
+// `ifdown` forces netifd's real teardown, removing the device and its routes.
+function ifdown_iface(name) {
+	const p = popen('ifdown ' + name + ' >/dev/null 2>&1');
+	if (p) p.close();
+}
+
 function singbox_installed() {
 	const out = trim(popen('ls /usr/bin/sing-box 2>/dev/null')?.read?.('all'));
 	return (length(out) > 0);
@@ -584,9 +595,12 @@ const methods = {
 			uci.unload();
 
 			if (is_singbox) {
-				// Switching to VLESS: mark all AWG disabled in UCI, then start sing-box.
-				// sing-box config handles routing loop prevention via bind_interface+
-				// route_exclude_address — no kernel route manipulation needed here.
+				// Switching to VLESS: mark all AWG disabled in UCI, then force
+				// every one of them down at the network layer (see ifdown_iface
+				// — UCI disabled=1 alone can leave a wg device up with a live
+				// default route, breaking routing for everything, not just
+				// VLESS), then start sing-box. sing-box's own config handles
+				// routing loop prevention via bind_interface+route_exclude_address.
 				uci.load('network');
 				for (let i = 0; i < length(ifaces); i++)
 					uci.set('network', ifaces[i], 'disabled', '1');
@@ -594,12 +608,26 @@ const methods = {
 				uci.commit('network');
 				uci.unload();
 
+				for (let i = 0; i < length(ifaces); i++)
+					ifdown_iface(ifaces[i]);
+
+				// An AWG peer with route_allowed_ips=1 replaces WAN's default
+				// route while it's up (that's how it forces all traffic
+				// through the tunnel) and nothing puts it back when the
+				// interface goes down — ifdown alone can leave the router
+				// with NO default route via the WAN device at all, which
+				// breaks sing-box's bind_interface dial to its own VLESS
+				// server. Re-asserting wan forces its default route back.
+				const wanup = popen('ifup wan >/dev/null 2>&1');
+				if (wanup) wanup.close();
+
 				const fw = popen('/etc/init.d/firewall restart >/dev/null 2>&1 &');
 				if (fw) fw.close();
 				const sb = popen('/etc/init.d/sing-box start >/dev/null 2>&1 &');
 				if (sb) sb.close();
 			} else {
-				// Switching to AWG: stop sing-box, enable target, disable others
+				// Switching to AWG: stop sing-box, enable target, force every
+				// other AWG interface down (not just flag it disabled).
 				const sb = popen('/etc/init.d/sing-box stop >/dev/null 2>&1');
 				if (sb) sb.close();
 
@@ -615,6 +643,10 @@ const methods = {
 				uci.commit('network');
 				uci.unload();
 
+				for (let i = 0; i < length(ifaces); i++)
+					if (ifaces[i] !== target)
+						ifdown_iface(ifaces[i]);
+
 				const fw  = popen('/etc/init.d/firewall restart >/dev/null 2>&1 &');
 				const net = popen('/etc/init.d/network restart >/dev/null 2>&1 &');
 				if (fw)  fw.close();
@@ -622,6 +654,29 @@ const methods = {
 			}
 
 			return { success: true, switched_to: target };
+		}
+	},
+
+	// Manual remediation: force a specific AWG interface down at the network
+	// layer, for when the UI shows it as "not fully down" (disabled in UCI
+	// but still up/handshaking at the kernel level).
+	force_ifdown: {
+		args: { name: 'name' },
+		call: function(req) {
+			const name = req.args ? req.args.name : null;
+			const ifaces = get_awg_interfaces();
+			if (!name || index(ifaces, name) === -1)
+				return { error: 'Unknown interface: ' + name };
+
+			ifdown_iface(name);
+
+			// If this interface had replaced WAN's default route (route_allowed_ips=1
+			// on a 0.0.0.0/0 peer), ifdown alone won't bring it back — see the
+			// matching comment in switch_vpn.
+			const wanup = popen('ifup wan >/dev/null 2>&1');
+			if (wanup) wanup.close();
+
+			return { success: true };
 		}
 	},
 };

@@ -8,7 +8,8 @@
           "switch_vpn",
           "add_vless_profile",
           "switch_vless_profile",
-          "delete_vless_profile"
+          "delete_vless_profile",
+          "force_ifdown"
         ]
       },
       "uci": [

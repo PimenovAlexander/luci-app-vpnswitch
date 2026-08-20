@@ -33,6 +33,12 @@ const delete_vless_profile = rpc.declare({
 	params: ['name']
 });
 
+const force_ifdown = rpc.declare({
+	object: 'luci.vpnswitch',
+	method: 'force_ifdown',
+	params: ['name']
+});
+
 function fmtBytes(n) {
 	if (!n) return '—';
 	if (n < 1024)       return n + ' B';
@@ -316,12 +322,18 @@ return view.extend({
 	renderCard: function(name, info, self) {
 		const is_active  = info.is_active_fwd && info.is_up;
 		const is_disabled = info.disabled;
+		// disabled=1 in UCI but still up at the kernel level: netifd failed to
+		// tear it down (leftover wg device, possibly still holding a route —
+		// see NOTES.md). This is the state that broke routing before.
+		const is_stale = is_disabled && info.is_up;
 
 		const statusEl = is_active
 			? self.statusBadge('ACTIVE',  '#28a745')
-			: is_disabled
-				? self.statusBadge('DISABLED', '#6c757d')
-				: self.statusBadge('STANDBY',  '#ffc107');
+			: is_stale
+				? self.statusBadge('NOT FULLY DOWN', '#dc3545')
+				: is_disabled
+					? self.statusBadge('DISABLED', '#6c757d')
+					: self.statusBadge('STANDBY',  '#ffc107');
 
 		const endpoint = info.endpoint_host
 			? (info.endpoint_host + ':' + info.endpoint_port) : '—';
@@ -343,6 +355,17 @@ return view.extend({
 			})
 		);
 
+		// Always render this node (never null/undefined as an E() child —
+		// this LuCI build's dom.append() stringifies non-element children,
+		// so a bare `null` here would literally render the text "null").
+		// Visibility is toggled with display instead.
+		const warning = E('div', {
+			'id': 'warn_' + name,
+			'style': 'margin-top:8px;padding:8px 12px;border-radius:4px;' +
+			         'background:#fff3f3;color:#dc3545;font-size:0.9em' +
+			         (is_stale ? '' : ';display:none')
+		}, '⚠ Disabled in config but still up — it may be holding onto routes it shouldn\'t. Use "Force down" to fix.');
+
 		const btn = E('button', {
 			'class': 'cbi-button cbi-button-' + (is_active ? 'save' : 'apply'),
 			'style': 'margin-top:12px',
@@ -360,14 +383,27 @@ return view.extend({
 			}
 		}, is_active ? '✓ Active' : 'Switch to ' + name);
 
+		const forceBtn = E('button', {
+			'id': 'force_' + name,
+			'class': 'cbi-button cbi-button-remove',
+			'style': 'margin-top:12px;margin-left:8px;' + (is_stale ? '' : 'display:none'),
+			'click': function(ev) {
+				ev.target.disabled    = true;
+				ev.target.textContent = '…';
+				force_ifdown(name).then(function() {
+					setTimeout(function() { window.location.reload(); }, 1500);
+				});
+			}
+		}, 'Force down');
+
 		return E('div', {
 			'id': 'card_' + name,
 			'style': [
-				'border:2px solid ' + (is_active ? '#28a745' : '#dee2e6'),
+				'border:2px solid ' + (is_active ? '#28a745' : is_stale ? '#dc3545' : '#dee2e6'),
 				'border-radius:6px',
 				'padding:16px',
 				'margin-bottom:16px',
-				'background:' + (is_active ? '#f0fff4' : '#fff'),
+				'background:' + (is_active ? '#f0fff4' : is_stale ? '#fff8f8' : '#fff'),
 				'transition:border-color 0.3s,background 0.3s'
 			].join(';')
 		}, [
@@ -376,13 +412,16 @@ return view.extend({
 				E('span', { 'id': 'badge_' + name }, statusEl)
 			]),
 			table,
-			btn
+			warning,
+			btn,
+			forceBtn
 		]);
 	},
 
 	updateCard: function(name, info, self) {
-		const is_active  = info.is_active_fwd && info.is_up;
+		const is_active   = info.is_active_fwd && info.is_up;
 		const is_disabled = info.disabled;
+		const is_stale    = is_disabled && info.is_up;
 
 		const up_el = document.getElementById('up_' + name);
 		if (up_el) up_el.textContent = info.is_up ? '✓ up' : '✗ down';
@@ -396,15 +435,22 @@ return view.extend({
 
 		const badge_el = document.getElementById('badge_' + name);
 		if (badge_el) {
-			const text  = is_active ? 'ACTIVE' : is_disabled ? 'DISABLED' : 'STANDBY';
-			const color = is_active ? '#28a745' : is_disabled ? '#6c757d' : '#ffc107';
+			const text  = is_active ? 'ACTIVE' : is_stale ? 'NOT FULLY DOWN' : is_disabled ? 'DISABLED' : 'STANDBY';
+			const color = is_active ? '#28a745' : is_stale ? '#dc3545' : is_disabled ? '#6c757d' : '#ffc107';
 			badge_el.replaceChildren(self.statusBadge(text, color));
 		}
 
+		const warn_el = document.getElementById('warn_' + name);
+		if (warn_el) warn_el.style.display = is_stale ? '' : 'none';
+
+		const force_el = document.getElementById('force_' + name);
+		if (force_el && !force_el.textContent.includes('…'))
+			force_el.style.display = is_stale ? '' : 'none';
+
 		const card_el = document.getElementById('card_' + name);
 		if (card_el) {
-			card_el.style.borderColor = is_active ? '#28a745' : '#dee2e6';
-			card_el.style.background  = is_active ? '#f0fff4' : '#fff';
+			card_el.style.borderColor = is_active ? '#28a745' : is_stale ? '#dc3545' : '#dee2e6';
+			card_el.style.background  = is_active ? '#f0fff4' : is_stale ? '#fff8f8' : '#fff';
 		}
 
 		const btn_el = document.getElementById('btn_' + name);
