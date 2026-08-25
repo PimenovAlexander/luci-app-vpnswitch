@@ -1,0 +1,20 @@
+#!/bin/sh
+# Installs the cron entry that drives the LAN health page's background
+# probes (see vpnswitch.uc run_health_check / NOTES.md "LAN health checks").
+# Idempotent (upsert) — safe to run again on package upgrade, and replaces a
+# previously-installed line with a different schedule instead of leaving it
+# stale (e.g. an older 5-minute interval from before it was tuned to 10).
+
+CRONFILE=/etc/crontabs/root
+CRONMARK='luci.vpnswitch run_health_check'
+CRONLINE='*/10 * * * * ubus call luci.vpnswitch run_health_check "{}" >/dev/null 2>&1'
+
+mkdir -p /etc/crontabs
+touch "$CRONFILE"
+
+grep -vF "$CRONMARK" "$CRONFILE" > "$CRONFILE.new"
+echo "$CRONLINE" >> "$CRONFILE.new"
+mv "$CRONFILE.new" "$CRONFILE"
+
+/etc/init.d/cron enable
+/etc/init.d/cron restart

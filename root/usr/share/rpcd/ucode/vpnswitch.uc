@@ -2,11 +2,42 @@
 'use strict';
 
 import { cursor } from 'uci';
-import { popen, open, lstat, symlink, readlink, unlink, mkdir, glob } from 'fs';
+import { popen, open, lstat, symlink, readlink, unlink, mkdir, rmdir, glob } from 'fs';
 
 const SINGBOX_IFACE  = 'vless';
 const SINGBOX_CONFIG = '/etc/sing-box/config.json';
 const PROFILES_DIR   = '/etc/sing-box/profiles';
+
+const HEALTH_LOG          = '/tmp/vpnswitch-health.jsonl';
+const HEALTH_MAX_ENTRIES  = 200;   // ~33h at the 10-min cron interval below
+const HEALTH_TIMEOUT      = 8;     // seconds, per wget attempt
+const HEALTH_TEST_URL     = 'https://1.1.1.1/cdn-cgi/trace';
+
+// Cron (every 10 min) and a manual "Run now" click can overlap — without
+// this, two concurrent run_health_check_impl() calls can delete each
+// other's in-flight nft exemption rule (one check's traffic gets pulled
+// back into the tunnel mid-request) and/or race on append_health_entry()'s
+// read-modify-write, silently losing an entry. mkdir() is atomic (fails
+// with null if the dir exists) in this ucode build's fs module — open()
+// has no exclusive-create mode, so a lockdir is the simplest primitive
+// available. HEALTH_LOCK_STALE is well over one check's worst case
+// (2 * HEALTH_TIMEOUT, ~16s) so a lock left behind by a killed rpcd/ucode
+// process doesn't wedge future checks forever.
+const HEALTH_LOCK_DIR     = '/tmp/vpnswitch-health.lock';
+const HEALTH_LOCK_STALE   = 60;
+
+// nftables coordinates of the exclusion mechanism sing-box's own auto_route
+// installs for route_exclude_address (see NOTES.md "routing loop"). The
+// `output` chain here is what redirects locally-generated TCP into tun-sb;
+// `prerouting` does the identical thing for LAN-forwarded traffic using the
+// same address set — confirmed live 2026-08-25, which is why a router-self
+// health check is representative of what a LAN client would see. We reuse
+// the same "ip daddr <x> return" pattern, scoped to one IP, to test a dest
+// domain directly instead of through the tunnel, without touching sing-box's
+// own config or restarting it.
+const NFT_TABLE   = 'inet sing-box';
+const NFT_CHAIN   = 'output';
+const NFT_COMMENT = 'vpnswitch-healthcheck';
 
 function get_awg_interfaces() {
 	const uci = cursor();
@@ -447,6 +478,266 @@ function build_singbox_config(vlessOut) {
 	};
 }
 
+/* ---------- LAN health checks ----------
+ * Two active probes, run from the router itself (see the NFT_* comment above
+ * for why that's representative of a LAN client):
+ *   - check_internet(): does a real HTTPS request complete through whatever
+ *     tunnel is currently active — the thing that actually broke on 2026-08-24
+ *     while every "is the process alive" signal stayed green.
+ *   - check_dest(): for an active VLESS+Reality profile only, tests the
+ *     Reality camouflage `dest` domain directly, bypassing the tunnel via a
+ *     temporary nft exemption. This is what would have caught the
+ *     koba-auto.com failure (see hosts.txt) as "dest is down" instead of a
+ *     multi-hour manual packet-capture investigation.
+ * Results are appended to a small capped JSON-lines ring buffer in /tmp
+ * (tmpfs — deliberately not persisted to flash) so the health page has
+ * recent history even between page loads. A cron job (see
+ * root/etc/uci-defaults/81_vpnswitch_health) calls run_health_check every
+ * 10 minutes; the frontend's "Run now" button calls the same ubus method.
+ */
+
+function is_valid_hostname(s) {
+	if (!s || !length(s) || length(s) > 253)
+		return false;
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+		const ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		           (c >= '0' && c <= '9') || c == '.' || c == '-';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+function looks_like_ipv4(s) {
+	if (!s)
+		return false;
+	const parts = split(s, '.');
+	if (length(parts) != 4)
+		return false;
+	for (let i = 0; i < 4; i++) {
+		const p = parts[i];
+		if (!length(p) || length(p) > 3)
+			return false;
+		for (let j = 0; j < length(p); j++) {
+			const c = substr(p, j, 1);
+			if (c < '0' || c > '9')
+				return false;
+		}
+	}
+	return true;
+}
+
+// nslookup's own answer lines look like "Address: 1.2.3.4" (no port); the
+// resolver line at the top is "Address: 127.0.0.1:53" — the colon is what
+// tells them apart.
+function resolve_ipv4(domain) {
+	if (!is_valid_hostname(domain))
+		return null;
+	const p = popen('nslookup ' + domain + ' 2>/dev/null');
+	const out = p ? p.read('all') : null;
+	if (p) p.close();
+	if (!out)
+		return null;
+
+	const lines = split(out, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const l = trim(lines[i]);
+		if (substr(l, 0, 8) != 'Address:')
+			continue;
+		const addr = trim(substr(l, 8));
+		if (index(addr, ':') < 0 && looks_like_ipv4(addr))
+			return addr;
+	}
+	return null;
+}
+
+function nft_table_ready() {
+	const p = popen('nft list table ' + NFT_TABLE + ' 2>/dev/null');
+	const out = p ? p.read('all') : null;
+	if (p) p.close();
+	return length(trim(out || '')) > 0;
+}
+
+// Returns the handle of our tagged exemption rule, or null if none is
+// present. Shared by nft_exempt_cleanup() (delete it) and nft_exempt_add()
+// (confirm the insert actually landed instead of trusting popen()'s exit
+// silently — nft's own stderr is discarded, so a failed insert would
+// otherwise look identical to a successful one).
+function nft_exempt_handle() {
+	const p = popen('nft -a list chain ' + NFT_TABLE + ' ' + NFT_CHAIN + ' 2>/dev/null');
+	const out = p ? p.read('all') : null;
+	if (p) p.close();
+	if (!out)
+		return null;
+
+	const lines = split(out, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		if (index(lines[i], NFT_COMMENT) < 0)
+			continue;
+		const hIdx = index(lines[i], '# handle ');
+		if (hIdx < 0)
+			continue;
+		return trim(substr(lines[i], hIdx + length('# handle ')));
+	}
+	return null;
+}
+
+function nft_exempt_cleanup() {
+	const handle = nft_exempt_handle();
+	if (!handle)
+		return;
+	const d = popen('nft delete rule ' + NFT_TABLE + ' ' + NFT_CHAIN + ' handle ' + handle + ' 2>/dev/null');
+	if (d) d.close();
+}
+
+// Returns false if the exemption couldn't be installed — either the
+// sing-box nftables table isn't present (e.g. AWG is active, or sing-box
+// just isn't running) or the insert itself didn't take (verified by
+// re-reading the chain, not assumed from popen() succeeding). Callers must
+// treat a check made without a successful exemption as inconclusive, not
+// as a real "dest is reachable" result — without the bypass, the request
+// would just get redirected into the tunnel like any other traffic and no
+// longer tests dest independently of it.
+function nft_exempt_add(ip) {
+	if (!looks_like_ipv4(ip) || !nft_table_ready())
+		return false;
+	nft_exempt_cleanup();
+	const p = popen('nft insert rule ' + NFT_TABLE + ' ' + NFT_CHAIN +
+	                 ' ip daddr ' + ip + ' return comment "' + NFT_COMMENT + '" 2>/dev/null');
+	if (p) p.close();
+	return nft_exempt_handle() != null;
+}
+
+function wget_probe(url) {
+	const t0 = time();
+	const p = popen('wget -T ' + HEALTH_TIMEOUT + ' --no-check-certificate -O /dev/null ' + url + ' 2>&1');
+	const out = p ? p.read('all') : '';
+	if (p) p.close();
+	return { out: out || '', elapsed_s: time() - t0 };
+}
+
+function check_internet() {
+	const t0 = time();
+	const p = popen('wget -T ' + HEALTH_TIMEOUT + ' --no-check-certificate -O- ' + HEALTH_TEST_URL + ' 2>&1');
+	const out = p ? p.read('all') : '';
+	if (p) p.close();
+	const elapsed = time() - t0;
+
+	const ok = (index(out, 'ip=') >= 0);
+	let exit_ip = null, colo = null, loc = null;
+
+	if (ok) {
+		const lines = split(out, '\n');
+		for (let i = 0; i < length(lines); i++) {
+			const l = trim(lines[i]);
+			if (substr(l, 0, 3) == 'ip=')        exit_ip = substr(l, 3);
+			else if (substr(l, 0, 5) == 'colo=') colo    = substr(l, 5);
+			else if (substr(l, 0, 4) == 'loc=')  loc     = substr(l, 4);
+		}
+	}
+
+	return { ok: ok, elapsed_s: elapsed, exit_ip: exit_ip, colo: colo, loc: loc };
+}
+
+// Only meaningful for an active reality profile. `bypassed: false` means the
+// nft exemption couldn't be installed (table missing) — the request, if any
+// was even made, went through the tunnel like everything else and this
+// result says nothing about dest's own health. The frontend must show that
+// distinctly from a real ok/fail.
+function check_dest(sni) {
+	const ip = resolve_ipv4(sni);
+	if (!ip)
+		return { ok: false, sni: sni, ip: null, bypassed: false, elapsed_s: 0, error: 'dns_failed' };
+
+	const bypassed = nft_exempt_add(ip);
+	const probe = wget_probe('https://' + sni + '/');
+	if (bypassed)
+		nft_exempt_cleanup();
+
+	return {
+		ok:         bypassed && (index(probe.out, 'Download completed') >= 0),
+		sni:        sni,
+		ip:         ip,
+		bypassed:   bypassed,
+		elapsed_s:  probe.elapsed_s,
+	};
+}
+
+// mkdir() is atomic in this ucode build's fs module (null if the dir
+// already exists) — see HEALTH_LOCK_DIR comment above for why this exists.
+function acquire_health_lock() {
+	const st = lstat(HEALTH_LOCK_DIR);
+	if (st && (time() - st.mtime) > HEALTH_LOCK_STALE)
+		rmdir(HEALTH_LOCK_DIR);
+	return mkdir(HEALTH_LOCK_DIR) === true;
+}
+
+function release_health_lock() {
+	rmdir(HEALTH_LOCK_DIR);
+}
+
+function active_vless_profile() {
+	const profiles = get_vless_profiles();
+	for (let i = 0; i < length(profiles); i++)
+		if (profiles[i].is_active)
+			return profiles[i];
+	return null;
+}
+
+function read_health_history() {
+	const raw = read_file(HEALTH_LOG);
+	if (!raw)
+		return [];
+	const lines = filter(split(trim(raw), '\n'), function(l) { return length(l) > 0; });
+	const out = [];
+	for (let i = 0; i < length(lines); i++) {
+		const e = json(lines[i]);
+		if (e)
+			push(out, e);
+	}
+	return out;
+}
+
+function append_health_entry(entry) {
+	let lines = filter(split(trim(read_file(HEALTH_LOG) || ''), '\n'), function(l) { return length(l) > 0; });
+	push(lines, sprintf('%J', entry));
+	if (length(lines) > HEALTH_MAX_ENTRIES)
+		lines = slice(lines, -HEALTH_MAX_ENTRIES);
+	write_file(HEALTH_LOG, join('\n', lines) + '\n');
+}
+
+// Serialized via acquire_health_lock()/release_health_lock() — cron (every
+// 10 min) and a manual "Run now" click can otherwise land close enough
+// together to race on the nft exemption and/or the history file (see
+// HEALTH_LOCK_DIR comment). If another check is already in flight, this
+// just returns the most recent recorded entry instead of running a second,
+// overlapping one.
+function run_health_check_impl() {
+	if (!acquire_health_lock()) {
+		const hist = read_health_history();
+		return length(hist) ? hist[length(hist) - 1] : null;
+	}
+
+	const active_fwd = get_active_fwd();
+	const entry = { ts: time(), target: active_fwd };
+
+	entry.internet = check_internet();
+	entry.dest = null;
+
+	if (active_fwd === SINGBOX_IFACE && singbox_installed() && singbox_running()) {
+		const active_p = active_vless_profile();
+		if (active_p && active_p.security == 'reality' && length(active_p.sni)) {
+			entry.dest = check_dest(active_p.sni);
+			entry.dest.profile = active_p.name;
+		}
+	}
+
+	append_health_entry(entry);
+	release_health_lock();
+	return entry;
+}
+
 const methods = {
 
 	get_status: {
@@ -677,6 +968,21 @@ const methods = {
 			if (wanup) wanup.close();
 
 			return { success: true };
+		}
+	},
+
+	// Runs both active probes synchronously (up to ~2*HEALTH_TIMEOUT seconds)
+	// and appends the result to the history ring buffer. Called both by the
+	// "Run now" button and by cron every 10 minutes.
+	run_health_check: {
+		call: function() {
+			return run_health_check_impl();
+		}
+	},
+
+	get_health_history: {
+		call: function() {
+			return { entries: read_health_history(), max_entries: HEALTH_MAX_ENTRIES };
 		}
 	},
 };

@@ -161,6 +161,51 @@ path for sing-box to reach its server before it sets up its own rules.
 - **`replace(subject, needle, repl)` is a single left-to-right pass, not recursive** —
   collapsing runs of a character (e.g. `--` → `-`) needs a `while (index(...) >= 0)` loop.
 
+## LAN health checks (added 2026-08-25)
+
+Two active probes exposed as `run_health_check` (call both, append to history)
+and `get_health_history` (read the ring buffer). See README.md's "LAN health
+page" section for what they check and why; this section is the *how*.
+
+- **Cron calls ubus, not a second script.** A `.uc` file's helpers can't be
+  shared via `import`/`include()` with the rpcd entry point (see the ucode
+  gotchas above), so rather than duplicating `get_active_fwd()`,
+  `get_vless_profiles()` etc. into a standalone cron script, the cron job is
+  just `ubus call luci.vpnswitch run_health_check "{}"` — it reuses the
+  already-running rpcd plugin instead of needing its own file at all. Local
+  `ubus call` invocations (as root, via cron) aren't subject to the rpcd ACL
+  — that only gates browser-originated `/ubus` HTTP calls.
+- **The dest bypass mutates live nftables state, briefly.** sing-box's own
+  `route_exclude_address` (server IP + private ranges) is implemented by
+  itself as `ip daddr { ... } return` rules in `table inet sing-box`, chain
+  `output` (locally-generated traffic) and `prerouting` (LAN-forwarded — same
+  address set, confirmed identical live 2026-08-25, which is *why* an
+  on-router check is representative of a LAN client's experience without any
+  namespace/veth trickery). `check_dest()` inserts one more `ip daddr <resolved
+  dest ip> return` rule into the `output` chain (tagged with a comment so it
+  can be found and removed), runs the request, then deletes it — never
+  touches sing-box's own config or restarts it. If the table doesn't exist
+  (AWG active, or sing-box not running) the insert is skipped and the result
+  is marked `bypassed: false` — callers must treat that as inconclusive, not
+  as a real pass/fail, since an unbypassed request would just get redirected
+  into the tunnel like anything else and test the VPS's reachability to dest
+  instead of the router's.
+- **No TLS-version pinning available.** `wget` on this firmware is
+  `uclient-fetch`, whose `--ciphers` flag sets the cipher list, not the TLS
+  version — there is no way to force TLS 1.3-only from the router the way
+  `openssl s_client -tls1_3` does from a dev machine. A dest that has quietly
+  fallen back to TLS 1.2 (see the `samokishevauto.bg` entry in
+  `../vpn/hosts.txt`) would still show `dest.ok: true` here. The health page
+  says so in its own copy; a real fix would need `openssl`/`ldopenssl`
+  installed via opkg, or the check delegated to a machine that has it.
+- **History format.** JSON-lines (one `sprintf('%J', entry)` object per line)
+  in `/tmp/vpnswitch-health.jsonl`, capped at `HEALTH_MAX_ENTRIES` (200) by a
+  read-all/slice/rewrite on every append — deliberately not append-mode I/O,
+  since the file is tiny (≲50KB) and this sidesteps needing to confirm ucode's
+  `fs.open(path, 'a')` support. Lives on tmpfs on purpose: recent health is
+  useful, and avoiding writes to the ~65MB overlay flash on a 10-minute cadence
+  matters more than surviving a reboot.
+
 ## Known limitations
 
 - Firewall zone name must equal the UCI interface name (or device name for vless zone).

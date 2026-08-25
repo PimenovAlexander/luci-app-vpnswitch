@@ -42,18 +42,42 @@ Shows live status (up/down, last handshake, transfer stats) and switches the act
 ```
 luci-app-vpnswitch/
 ├── htdocs/luci-static/resources/view/vpnswitch/
-│   └── dashboard.js                        # LuCI frontend (JavaScript)
+│   ├── dashboard.js                        # LuCI frontend — switch tunnels (JavaScript)
+│   └── health.js                           # LuCI frontend — LAN health page (JavaScript)
 └── root/
     ├── etc/uci-defaults/
-    │   └── 80_vpnswitch                    # Post-install: restarts rpcd
+    │   ├── 80_vpnswitch                    # Post-install: restarts rpcd
+    │   └── 81_vpnswitch_health             # Post-install: installs the health-check cron job
     └── usr/share/
         ├── luci/menu.d/
-        │   └── luci-app-vpnswitch.json     # Registers Services → VPN Switch
+        │   └── luci-app-vpnswitch.json     # Registers Services → VPN Switch (+ Health tab)
         ├── rpcd/acl.d/
         │   └── luci-app-vpnswitch.json     # ACL: grants network/firewall read+write
         └── rpcd/ucode/
-            └── vpnswitch.uc               # RPC backend (ucode)
+            └── vpnswitch.uc               # RPC backend (ucode) — switching + health checks
 ```
+
+## LAN health page
+
+A second tab (Services → VPN Switch → Health) that answers "is the VPN actually
+useful right now", not just "is the process running":
+
+- **Internet via active tunnel** — a real HTTPS request through whatever's
+  currently active (VLESS or AWG), run from the router itself. The router's
+  own traffic goes through the exact same nftables redirect/exclusion rules
+  as LAN-forwarded traffic (see `NFT_TABLE`/`NFT_CHAIN` in `vpnswitch.uc`),
+  so this is representative of what a LAN client would see, without needing
+  a real second device or network-namespace tricks (which this router's
+  firmware doesn't have the kernel modules for anyway).
+- **Reality dest health** (VLESS only) — tests the active profile's Reality
+  camouflage domain (`server_name`) directly, bypassing the tunnel via a
+  temporary nftables exemption. This is the check that would have caught
+  both `samokishevauto.bg` and `koba-auto.com` going bad (see `../vpn/hosts.txt`)
+  as "dest is down" instantly, instead of a multi-hour manual investigation.
+- A small ring buffer (`/tmp/vpnswitch-health.jsonl`, capped at 200 entries,
+  tmpfs — not persisted across reboots) keeps recent history. A cron job
+  (installed by `81_vpnswitch_health`) runs both checks every 10 minutes;
+  the page's "Run now" button runs them on demand via the same ubus method.
 
 ## Installation
 
@@ -76,7 +100,21 @@ ssh $ROUTER "cat > /usr/share/luci/menu.d/luci-app-vpnswitch.json" \
 ssh $ROUTER "cat > /www/luci-static/resources/view/vpnswitch/dashboard.js" \
     < $BASE/htdocs/luci-static/resources/view/vpnswitch/dashboard.js
 
+ssh $ROUTER "cat > /www/luci-static/resources/view/vpnswitch/health.js" \
+    < $BASE/htdocs/luci-static/resources/view/vpnswitch/health.js
+
+ssh $ROUTER "cat > /etc/uci-defaults/81_vpnswitch_health && chmod +x /etc/uci-defaults/81_vpnswitch_health" \
+    < $BASE/root/etc/uci-defaults/81_vpnswitch_health
+
 ssh $ROUTER "/etc/init.d/rpcd restart"
+
+# uci-defaults scripts only run automatically on first install via opkg — on a
+# manual/re-deploy, run the health cron installer once by hand (idempotent):
+ssh $ROUTER "sh /etc/uci-defaults/81_vpnswitch_health"
+
+# LuCI caches the parsed menu.d output — clear it so the new Health tab shows
+# up without waiting for the cache to expire on its own:
+ssh $ROUTER "rm -f /tmp/luci-indexcache*"
 ```
 
 Open LuCI → **Services → VPN Switch**.  

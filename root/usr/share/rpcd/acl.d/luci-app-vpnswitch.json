@@ -9,7 +9,9 @@
           "add_vless_profile",
           "switch_vless_profile",
           "delete_vless_profile",
-          "force_ifdown"
+          "force_ifdown",
+          "run_health_check",
+          "get_health_history"
         ]
       },
       "uci": [
